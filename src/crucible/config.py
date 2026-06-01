@@ -32,6 +32,7 @@ class Config:
     total_steps: int = 500
     seed: int = 0
     resume: bool = False  # continue from save_dir/checkpoint.pt instead of starting fresh
+    mem_restart_gb: float = 0.0  # if >0 (MPS): checkpoint and exit for a fresh process when driver memory exceeds this
 
     # Reward shaping
     correct_reward: float = 1.0
@@ -68,15 +69,17 @@ SMOKE = Config(
 GSM8K_0P5B = Config(
     model_name="Qwen/Qwen2.5-0.5B-Instruct",
     dtype="float32",  # pure-bf16 RL overflowed logits/grads into NaN and poisoned the weights; fp32 is stable and cheap at 0.5B
-    group_size=6,
+    group_size=4,
     prompts_per_step=4,
-    max_new_tokens=320,
+    max_new_tokens=256,
     top_p=0.95,
-    # Sized for the M5 Pro: generation (group_size * max_new_tokens) dominates and
-    # ran ~86 s/step here, so 300 steps lands around an 8-hour overnight run. The
-    # bottleneck is MPS generation speed, not memory (per-step cache-free keeps it
-    # comfortably inside 48GB). Resume from a checkpoint to extend further.
-    total_steps=300,
+    # The MPS allocator leaks ~1.5GB/step and won't release it (OOM'd ~step 28 on
+    # 48GB regardless of cache-freeing). Rather than fight it, the watchdog
+    # checkpoints and restarts for a fresh process at 42GB (~every ~15 steps); the
+    # scripts/supervise.sh loop auto-resumes, so the full run completes at full quality.
+    # ~46 s/step, 400 steps ~= 5h overnight including restart overhead.
+    total_steps=400,
+    mem_restart_gb=42.0,
     save_dir="runs/gsm8k_0p5b",
 )
 

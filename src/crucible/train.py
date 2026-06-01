@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import random
+import sys
+
+# Exit code the trainer uses to ask the supervisor for a fresh process (PyTorch's
+# MPS allocator leaks across steps and empty_cache won't reclaim it; a restart is
+# the only thing that resets it). Distinct from 0 (run complete) and other crashes.
+RESTART_EXIT_CODE = 42
 
 # MPS lacks a few ops used by some models; fall back to CPU for those instead of crashing.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -39,12 +46,24 @@ def _parse_args():
 
 
 def _free_cache(device: str) -> None:
-    """Release the allocator's cached blocks so eval's generation peak doesn't
-    stack on top of training's and trip the MPS memory ceiling."""
+    """Release the allocator's cached blocks so each step's generation peak doesn't
+    stack on the last and trip the MPS memory ceiling. gc.collect() first: dropped
+    tensors from the previous step often aren't collected yet when empty_cache runs,
+    so without it their blocks never return and 'other allocations' creep up to OOM."""
+    gc.collect()
     if device == "mps":
         torch.mps.empty_cache()
     elif device == "cuda":
         torch.cuda.empty_cache()
+
+
+def _mem_gb(device: str) -> float:
+    """Driver-allocated memory in GiB, for watching the trend across steps."""
+    if device == "mps":
+        return torch.mps.driver_allocated_memory() / 1024**3
+    if device == "cuda":
+        return torch.cuda.memory_reserved() / 1024**3
+    return 0.0
 
 
 def make_rollout(cfg, tok, policy, ref, sample, device):
@@ -164,6 +183,9 @@ def main():
         # otherwise accumulate and fragment across steps until an OOM (seen at
         # step 28 with ~44GiB of stale "other allocations" on a 48GB machine).
         _free_cache(device)
+        mem_gb = _mem_gb(device)
+        logger.log(step, "mem", mem_gb=round(mem_gb, 2))
+
         if step % cfg.eval_every == 0:
             acc = accuracy(policy, tok, eval_set, cfg, device)
             print(f"step={step} eval_acc={acc:.3f}")
@@ -171,6 +193,16 @@ def main():
             save_checkpoint(cfg.save_dir, policy, opt, step)
             print(f"  checkpoint saved at step {step}")
             _free_cache(device)
+
+        # Memory watchdog: the MPS allocator leaks ~1.5GB/step and won't release it,
+        # so rather than crash into an OOM we checkpoint and ask the supervisor for a
+        # fresh process the moment we approach the ceiling. A fresh process resets the
+        # leak; --resume picks up exactly here. No steps are lost.
+        if cfg.mem_restart_gb and mem_gb > cfg.mem_restart_gb and step < cfg.total_steps:
+            save_checkpoint(cfg.save_dir, policy, opt, step)
+            print(f"step={step} mem={mem_gb:.1f}GB > {cfg.mem_restart_gb}GB — "
+                  f"checkpointed, restarting for a fresh allocator")
+            sys.exit(RESTART_EXIT_CODE)
 
     policy.save_pretrained(cfg.save_dir)
     tok.save_pretrained(cfg.save_dir)
