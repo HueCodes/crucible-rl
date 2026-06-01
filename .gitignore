@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Runs and checkpoints
+runs/
+checkpoints/
+*.pt
+*.safetensors
+
+# Logs and local data
+*.log
+wandb/
+
+# OS
+.DS_Store
