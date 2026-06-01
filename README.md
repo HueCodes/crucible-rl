@@ -41,9 +41,32 @@ two steps so you can confirm the loop trains before committing to a full run.
 `train.py` prints a baseline eval accuracy at step 0, then reward and eval
 accuracy as it goes.
 
+For a full overnight run on MPS, use the supervisor — it checkpoints and
+auto-resumes around PyTorch's MPS allocator leak (see `docs/MPS_LEAK.md`):
+
+    scripts/supervise.sh gsm8k_0p5b        # resumes from runs/<preset>/checkpoint.pt
+    uv run python -m crucible.train --preset gsm8k_0p5b --resume   # one-off resume
+
+## Results
+
+Phase 1 (Qwen2.5-0.5B-Instruct, GSM8K, 400 steps on a 48GB M5 Pro):
+
+| metric | value |
+|--------|-------|
+| baseline eval acc | 0.125 |
+| final eval acc | **0.438** |
+| relative improvement | **3.5×** |
+
+![training curves](docs/training_curves.png)
+
+Eval accuracy roughly tripled; KL stayed stable throughout. Full write-up and
+caveats in [`docs/PHASE1.md`](docs/PHASE1.md).
+
 ## Notes
 
 - Optional LoRA for the 1.5B preset: `uv sync --extra lora`.
 - MPS fallback for unsupported ops is enabled in `train.py`.
+- Long runs checkpoint every eval and can `--resume`; the MPS allocator leak and
+  its workaround are documented in `docs/MPS_LEAK.md`.
 - This is standalone. Hardware deployment and an inference engine are separate
   projects, not dependencies.
