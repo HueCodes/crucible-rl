@@ -5,13 +5,16 @@ Run with:  uv run pytest        (or)   uv run python tests/test_rewards.py
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
-from crucible.grpo import grpo_loss, group_advantages
+from crucible.grpo import grpo_loss, group_advantages, sequence_logprobs
 from crucible.rewards import correctness_reward, extract_answer, format_reward, score
 
 GOOD = "<think>2 plus 2 is 4</think><answer>4</answer>"
 WRONG = "<think>guessing</think><answer>5</answer>"
 UNFORMATTED = "the answer is 4"
+# A think/answer block followed by trailing text — common in real generations.
+TRAILING = "<think>add them</think>\n<answer>4</answer>\nSo the answer is 4."
 
 
 def test_extract_answer():
@@ -35,6 +38,8 @@ def test_format_reward():
     assert format_reward(UNFORMATTED, 0.5) == 0.0
     # answer without preceding think block does not satisfy the format
     assert format_reward("<answer>4</answer>", 0.5) == 0.0
+    # trailing text after </answer> still counts (the old anchored regex rejected it)
+    assert format_reward(TRAILING, 0.5) == 0.5
 
 
 def test_score_combines():
@@ -51,6 +56,35 @@ def test_group_advantages_zero_mean_unit_scale():
 def test_group_advantages_constant_group_is_flat():
     adv = group_advantages(torch.tensor([1.0, 1.0, 1.0]))
     assert torch.allclose(adv, torch.zeros_like(adv), atol=1e-3)
+
+
+class _FakeOut:
+    def __init__(self, logits):
+        self.logits = logits
+
+
+class _FakeModel:
+    """Minimal stand-in for a HF causal LM: returns fixed logits for any input."""
+    def __init__(self, logits):
+        self._logits = logits
+
+    def __call__(self, input_ids, attention_mask):
+        return _FakeOut(self._logits)
+
+
+def test_sequence_logprobs_matches_log_softmax():
+    # The memory-efficient logit-minus-logsumexp form must equal the realized
+    # token's log-prob under a full log_softmax, to ~float precision.
+    torch.manual_seed(0)
+    b, t, vocab = 2, 5, 17
+    ids = torch.randint(0, vocab, (b, t))
+    logits = torch.randn(b, t, vocab)
+    model = _FakeModel(logits)
+    got = sequence_logprobs(model, ids, torch.ones_like(ids))
+    ref = F.log_softmax(logits[:, :-1, :].float(), dim=-1).gather(
+        -1, ids[:, 1:].unsqueeze(-1)
+    ).squeeze(-1)
+    assert torch.allclose(got, ref, atol=1e-5)
 
 
 def test_grpo_loss_shapes_and_kl_zero_at_ref():

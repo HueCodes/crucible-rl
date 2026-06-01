@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import InfNanRemoveLogitsProcessor, LogitsProcessorList
 
 from .config import Config
 from .data import build_messages
@@ -55,6 +56,10 @@ def generate_group(policy, tok, prompt_ids: torch.Tensor, cfg: Config, greedy: b
     """
     prompt_len = prompt_ids.shape[1]
     n = 1 if greedy else cfg.group_size
+    # bfloat16 generation on MPS occasionally overflows a logit to inf, which
+    # softmaxes to nan and crashes torch.multinomial ("probability tensor
+    # contains inf, nan or element < 0"). Scrub non-finite logits before sampling.
+    logits_processor = LogitsProcessorList([InfNanRemoveLogitsProcessor()])
     out = policy.generate(
         prompt_ids,
         attention_mask=torch.ones_like(prompt_ids),
@@ -64,12 +69,16 @@ def generate_group(policy, tok, prompt_ids: torch.Tensor, cfg: Config, greedy: b
         max_new_tokens=cfg.max_new_tokens,
         num_return_sequences=n,
         pad_token_id=tok.pad_token_id,
+        logits_processor=logits_processor,
     )
     attn = (out != tok.pad_token_id).long()
-    # Generation appends to the right of a left-padded prompt, so completion
-    # tokens are everything past prompt_len that is not padding.
+    # Completion tokens are everything generated past the prompt, kept up to and
+    # including the first EOS — the stop action we *want* the policy to learn —
+    # and excluding the right-padding after it. pad_token_id == eos_token_id, so
+    # the real EOS is told apart from padding by position (first one), not by id.
+    gen = out[:, prompt_len:]
+    eos_seen = (gen == tok.eos_token_id).long().cumsum(dim=1)
     completion_mask = torch.zeros_like(out)
-    completion_mask[:, prompt_len:] = 1
-    completion_mask = completion_mask & (out != tok.pad_token_id)
-    completion_text = tok.batch_decode(out[:, prompt_len:], skip_special_tokens=True)
+    completion_mask[:, prompt_len:] = (eos_seen <= 1).long()
+    completion_text = tok.batch_decode(gen, skip_special_tokens=True)
     return out, attn, completion_mask, completion_text

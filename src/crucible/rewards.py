@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-# Matches a full think-then-answer response. Used by the format reward.
-_FORMAT_RE = re.compile(r"^\s*<think>.*</think>\s*<answer>.*</answer>\s*$", re.DOTALL)
+# Rewards a think-then-answer structure. Searched (not full-matched) so trailing
+# or surrounding text doesn't void the bonus — the old anchored ^...$ match meant
+# any stray token after </answer> scored zero, so the format reward never fired.
+_FORMAT_RE = re.compile(r"<think>.*?</think>\s*<answer>.*?</answer>", re.DOTALL)
 # Pulls the last <answer> span (models sometimes emit more than one).
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 # A signed number, integer or decimal, possibly with thousands commas.
@@ -38,7 +40,7 @@ def correctness_reward(completion: str, gold: str, weight: float) -> float:
 
 
 def format_reward(completion: str, weight: float) -> float:
-    return weight if _FORMAT_RE.match(completion) else 0.0
+    return weight if _FORMAT_RE.search(completion) else 0.0
 
 
 @dataclass

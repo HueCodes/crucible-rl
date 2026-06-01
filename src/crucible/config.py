@@ -17,6 +17,8 @@ class Config:
     inner_epochs: int = 1        # policy updates per rollout batch (PPO-style reuse)
     clip_eps: float = 0.2        # PPO ratio clip
     beta_kl: float = 0.04        # KL penalty weight against the frozen reference
+    kl_guard: float = 40.0       # skip an optimizer step whose mean KL exceeds this (divergence guard)
+    grad_norm_guard: float = 1e3 # skip a step whose pre-clip grad norm spikes past this (instability guard)
 
     # Sampling
     temperature: float = 1.0
@@ -29,6 +31,7 @@ class Config:
     max_grad_norm: float = 1.0
     total_steps: int = 500
     seed: int = 0
+    resume: bool = False  # continue from save_dir/checkpoint.pt instead of starting fresh
 
     # Reward shaping
     correct_reward: float = 1.0
@@ -48,6 +51,7 @@ class Config:
 # A tiny configuration that wires the whole loop end to end on a 0.5B model in a
 # few minutes, so the first thing to run after setup proves nothing is broken.
 SMOKE = Config(
+    dtype="float32",  # match the real preset; bf16 RL is unstable on MPS (see GSM8K_0P5B)
     group_size=4,
     prompts_per_step=2,
     max_new_tokens=128,
@@ -57,13 +61,22 @@ SMOKE = Config(
     save_dir="runs/smoke",
 )
 
-# The real starter run: 0.5B Qwen on GSM8K. Fits comfortably in 48GB.
+# The real starter run: 0.5B Qwen on GSM8K. Sized to leave headroom on a 64GB
+# machine — group_size*max_new_tokens drives peak activation memory for backward,
+# and the earlier 8x512 setting OOM'd MPS at ~61/64GiB. top_p<1 trims the
+# degenerate-token tail that spikes the KL term.
 GSM8K_0P5B = Config(
     model_name="Qwen/Qwen2.5-0.5B-Instruct",
-    group_size=8,
+    dtype="float32",  # pure-bf16 RL overflowed logits/grads into NaN and poisoned the weights; fp32 is stable and cheap at 0.5B
+    group_size=6,
     prompts_per_step=4,
-    max_new_tokens=512,
-    total_steps=500,
+    max_new_tokens=320,
+    top_p=0.95,
+    # Sized for the M5 Pro: generation (group_size * max_new_tokens) dominates and
+    # ran ~86 s/step here, so 300 steps lands around an 8-hour overnight run. The
+    # bottleneck is MPS generation speed, not memory (per-step cache-free keeps it
+    # comfortably inside 48GB). Resume from a checkpoint to extend further.
+    total_steps=300,
     save_dir="runs/gsm8k_0p5b",
 )
 
