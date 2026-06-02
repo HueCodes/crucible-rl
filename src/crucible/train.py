@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import gc
+import math
 import os
 import random
 import sys
 
-# Exit code the trainer uses to ask the supervisor for a fresh process (PyTorch's
-# MPS allocator leaks across steps and empty_cache won't reclaim it; a restart is
-# the only thing that resets it). Distinct from 0 (run complete) and other crashes.
+# Exit code the trainer uses to ask the supervisor for a fresh process: MPS memory
+# grows per step and a fresh process is the only reliable reset (see docs/MPS_LEAK.md).
+# Distinct from 0 (run complete) and any other non-zero crash.
 RESTART_EXIT_CODE = 42
 
 # MPS lacks a few ops used by some models; fall back to CPU for those instead of crashing.
@@ -105,6 +106,40 @@ def rollout_loss(cfg, policy, r):
     return loss, metrics
 
 
+def _step_diverged(cfg, grad_norm: float, kl: float) -> bool:
+    """Stability guard: skip an update whose gradient is non-finite, pathologically
+    large (a spike that signals an unstable batch, even though clipping bounds the
+    applied step), or whose KL has blown past the configured ceiling. Keeps an
+    unattended run from silently corrupting the policy."""
+    return (not math.isfinite(grad_norm)) or grad_norm > cfg.grad_norm_guard or kl > cfg.kl_guard
+
+
+def optimize_on_rollouts(cfg, policy, opt, rollouts):
+    """Run cfg.inner_epochs PPO updates over the already-sampled rollouts. Returns
+    the mean metrics across the updates, the last gradient norm, and whether the
+    stability guard skipped any update."""
+    agg = {"loss": 0.0, "kl": 0.0, "reward": 0.0, "acc": 0.0}
+    grad_norm = 0.0
+    any_skipped = False
+    for _ in range(cfg.inner_epochs):
+        opt.zero_grad(set_to_none=True)
+        ep = {"loss": 0.0, "kl": 0.0, "reward": 0.0, "acc": 0.0}
+        for r in rollouts:
+            loss, m = rollout_loss(cfg, policy, r)
+            (loss / cfg.prompts_per_step).backward()
+            for k in ep:
+                ep[k] += m[k] / cfg.prompts_per_step
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm))
+        if _step_diverged(cfg, grad_norm, ep["kl"]):
+            opt.zero_grad(set_to_none=True)
+            any_skipped = True
+        else:
+            opt.step()
+        for k in agg:
+            agg[k] += ep[k] / cfg.inner_epochs
+    return agg, grad_norm, any_skipped
+
+
 def main():
     cfg = _parse_args()
     set_seed(cfg.seed)
@@ -137,42 +172,13 @@ def main():
         # inner PPO epochs (each epoch is its own optimizer step on the same data).
         rollouts = [make_rollout(cfg, tok, policy, ref, s, device) for s in batch]
 
-        agg = {"loss": 0.0, "kl": 0.0, "reward": 0.0, "acc": 0.0}
-        any_skipped = False
-        last_gnorm = 0.0
-        for _epoch in range(cfg.inner_epochs):
-            opt.zero_grad(set_to_none=True)
-            ep = {"loss": 0.0, "kl": 0.0, "reward": 0.0, "acc": 0.0}
-            for r in rollouts:
-                loss, m = rollout_loss(cfg, policy, r)
-                (loss / cfg.prompts_per_step).backward()
-                for k in ep:
-                    ep[k] += m[k] / cfg.prompts_per_step
-
-            gnorm = torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-            # Don't let a single diverged update corrupt the policy: skip it if the
-            # gradient is non-finite, pathologically large (a spike that signals an
-            # unstable batch even though clipping bounds the applied step), or the
-            # KL has blown past the guard. This is what keeps an unattended
-            # overnight run from silently going off the rails.
-            skipped = (
-                (not torch.isfinite(gnorm))
-                or (float(gnorm) > cfg.grad_norm_guard)
-                or (ep["kl"] > cfg.kl_guard)
-            )
-            if skipped:
-                opt.zero_grad(set_to_none=True)
-                any_skipped = True
-                print(f"step={step} SKIPPED (kl={ep['kl']:.2f} grad_norm={float(gnorm):.2f})")
-            else:
-                opt.step()
-            last_gnorm = float(gnorm)
-            for k in agg:
-                agg[k] += ep[k] / cfg.inner_epochs
+        agg, grad_norm, skipped = optimize_on_rollouts(cfg, policy, opt, rollouts)
+        if skipped:
+            print(f"step={step} SKIPPED (kl={agg['kl']:.2f} grad_norm={grad_norm:.2f})")
 
         logger.log(
             step, "train", loss=agg["loss"], reward=agg["reward"],
-            acc=agg["acc"], kl=agg["kl"], grad_norm=last_gnorm, skipped=any_skipped,
+            acc=agg["acc"], kl=agg["kl"], grad_norm=grad_norm, skipped=skipped,
         )
         if step % cfg.log_every == 0:
             print(
@@ -194,14 +200,14 @@ def main():
             print(f"  checkpoint saved at step {step}")
             _free_cache(device)
 
-        # Memory watchdog: the MPS allocator leaks ~1.5GB/step and won't release it,
-        # so rather than crash into an OOM we checkpoint and ask the supervisor for a
-        # fresh process the moment we approach the ceiling. A fresh process resets the
-        # leak; --resume picks up exactly here. No steps are lost.
+        # Memory watchdog: MPS memory grows ~1.5GB/step and won't release within a
+        # process (see docs/MPS_LEAK.md), so before hitting the ceiling we checkpoint
+        # and ask the supervisor for a fresh process. --resume picks up exactly here,
+        # so no steps are lost.
         if cfg.mem_restart_gb and mem_gb > cfg.mem_restart_gb and step < cfg.total_steps:
             save_checkpoint(cfg.save_dir, policy, opt, step)
-            print(f"step={step} mem={mem_gb:.1f}GB > {cfg.mem_restart_gb}GB — "
-                  f"checkpointed, restarting for a fresh allocator")
+            print(f"step={step} mem={mem_gb:.1f}GB over the {cfg.mem_restart_gb}GB cap, "
+                  f"checkpointed and restarting for a fresh process")
             sys.exit(RESTART_EXIT_CODE)
 
     policy.save_pretrained(cfg.save_dir)

@@ -62,10 +62,9 @@ SMOKE = Config(
     save_dir="runs/smoke",
 )
 
-# The real starter run: 0.5B Qwen on GSM8K. Sized to leave headroom on a 64GB
-# machine — group_size*max_new_tokens drives peak activation memory for backward,
-# and the earlier 8x512 setting OOM'd MPS at ~61/64GiB. top_p<1 trims the
-# degenerate-token tail that spikes the KL term.
+# The real starter run: Qwen2.5-0.5B on GSM8K, fp32 on a 48GB Mac via MPS.
+# Results are in docs/PHASE1.md; the memory workaround is explained in
+# docs/MPS_LEAK.md. top_p < 1 trims the degenerate-token tail that spikes KL.
 GSM8K_0P5B = Config(
     model_name="Qwen/Qwen2.5-0.5B-Instruct",
     dtype="float32",  # pure-bf16 RL overflowed logits/grads into NaN and poisoned the weights; fp32 is stable and cheap at 0.5B
