@@ -1,101 +1,63 @@
-# MPS memory growth — investigation plan
+# MPS memory growth: investigation and resolution
 
-**Status:** parked until the GSM8K run finishes (don't compete for the 48GB GPU).
-Currently *worked around* by a memory watchdog + auto-resume supervisor; this doc is
-about finding the *root cause* and possibly contributing a fix upstream.
+**Resolution:** the root cause was MPSGraph caching a compiled graph per input
+shape for the embedding (and matmul) backward. It was not an allocator leak and
+not an `empty_cache` bug. It is already fixed in the PyTorch nightly
+(2.13.0.dev20260601), verified below. On the released 2.12.0 the workaround is the
+memory watchdog plus `scripts/supervise.sh`. After upgrading to torch 2.13 stable,
+the workaround can be removed. No upstream issue or PR is needed.
 
-## What we observed
+## What happened
 
-During fp32 GRPO training on MPS (M5 Pro, 48GB, torch 2.12.0, macOS 26.4), driver
-memory climbs ~1.5–2.5 GB per step and is **not** reclaimed by `gc.collect()` +
-`torch.mps.empty_cache()` (both called every step). It OOMs around step ~28 from a
-fresh process. A fresh process resets it (e.g. 42 GB → 24 GB across a restart).
+fp32 GRPO training on MPS (M5 Pro, 48GB, torch 2.12.0) grew driver-allocated
+memory about 1.5GB/step and OOM'd around step 28, despite `gc.collect()` and
+`torch.mps.empty_cache()` every step. A fresh process reset it.
 
-Measured trend (one run, group 4 / 256 tok):
+## What it was NOT (corrected from earlier guesses)
 
-```
-step 1  18.0 GB
-step 6  30.2 GB
-step 11 38.8 GB
-step 16 46.5 GB
-step 21 50.6 GB
-step 26 55.0 GB   -> OOM at step 28
-```
+- Not our code. A standalone repro with zero Crucible code reproduces it
+  (`scripts/mps_leak_repro.py`).
+- Not a live-tensor leak. `current_allocated_memory()` stays flat (~4.4GB); only
+  `driver_allocated_memory()` grows. The growth is reserved memory, not live tensors.
+- Not an allocator/`empty_cache` bug. `empty_cache` cannot reclaim it because the
+  memory is held by MPSGraph's compiled-graph cache, which the caching allocator
+  does not own.
 
-## Current workaround (in tree, working)
+## Root cause
 
-- `Config.mem_restart_gb` (42.0 for the gsm8k preset): when driver memory crosses it,
-  the trainer checkpoints and exits with `RESTART_EXIT_CODE` (42).
-- `scripts/supervise.sh` re-launches with `--resume`; a fresh process resets the leak.
-- The run completes at full quality, spread across ~30 short-lived processes.
+MPSGraph compiles and caches one graph per distinct input shape. RL rollouts have a
+different completion length every step, so each new shape adds a cached graph and
+its buffers. The embedding backward was the dominant offender: it cached a
+vocab-by-dim gradient buffer per shape. Same class as pytorch/pytorch#181213
+(closed, completed), where the team fixed gelu, softmax, and SDPA by adding Metal
+kernel paths.
 
-This is fine for getting runs done, but it costs ~30 process reloads and is a band-aid.
+## Evidence
 
-## Hypotheses (what we don't yet know)
+`scripts/mps_op_isolate.py`, varying only sequence length with weights fixed,
+driver-memory growth over the loop:
 
-1. **Variable-shape caching.** Each step's rollouts have different sequence lengths →
-   new `[group, seq, vocab]` tensor shapes → the MPS caching allocator reserves a new
-   size-bucket per shape and `empty_cache()` doesn't release them. Arguably "intended
-   caching," but `empty_cache()` failing to reclaim is still a legitimate report.
-2. **General MPS allocation leak.** A buffer that's never freed regardless of shape.
-   This is the strongest upstream-bug case.
-3. **Our code.** The `rollouts` list / cached tensors in `train.py` hold references
-   across steps. If so it's *our* bug — fix it here, no upstream work.
+| op | torch 2.12.0 | torch 2.13.0.dev |
+|----|--------------|------------------|
+| logsumexp | flat | flat |
+| matmul | +91 MB (PREFER_METAL: flat) | +90 MB (PREFER_METAL: flat) |
+| embedding backward | +1746 MB | flat (fixed) |
+| full model (40 steps) | +18,500 MB | +15 MB (fixed) |
 
-## Step 1 — run the reproducer (decides everything)
+On nightly the full model held flat over 80 steps (5537 to 5571 MB). On 2.12.0 the
+same loop OOMs. `PYTORCH_MPS_PREFER_METAL=1` covers matmul but not embedding on
+2.12.0, so it is not a full fix there. The residual matmul growth is bounded (the
+full model with a matmul head stays flat), so it is not a concern.
 
-`scripts/mps_leak_repro.py` is standalone (no Crucible code). It runs forward+backward
-on a tiny large-vocab model with **fixed** vs **variable** sequence length and prints
-the memory growth for each.
+## What to do
 
-```
-.venv/bin/python scripts/mps_leak_repro.py     # only when the GPU is otherwise idle
-```
-
-Decision tree from the two growth columns:
-
-| fixed | variable | conclusion | next action |
-|-------|----------|------------|-------------|
-| flat  | grows    | shape-bucket caching / `empty_cache` not reclaiming (H1) | upstream report; **also** try padding our rollouts to fixed length (may remove the supervisor entirely) |
-| grows | grows    | general MPS leak (H2) | strongest upstream report; consider source build + allocator fix |
-| flat  | flat     | not PyTorch — it's our `rollouts` refs (H3) | fix in this repo; drop the supervisor |
-
-## Step 2 — if it's PyTorch, contribute upstream
-
-1. **Search first.** github.com/pytorch/pytorch issues for "MPS memory leak",
-   "empty_cache mps not releasing", "mps memory grows". MPS memory reports are common —
-   adding a *clean minimal repro* to an existing issue is high value on its own.
-2. **File / comment** with: the repro output, `torch.__version__`, macOS version, chip,
-   and the key fact that `empty_cache()` does not reclaim.
-3. **Possible workaround to report alongside:** if H1, fixed-shape tensors avoid it.
-
-## Step 3 — only if a code fix looks tractable: build from source
-
-Feasible on this 48GB M5 Pro (Xcode + cmake + ninja already installed, 700GB free):
-
-| Need | This machine |
-|------|--------------|
-| Disk | build ~15–25 GB; have ~700 GB |
-| Build RAM | the one constraint — cap `MAX_JOBS=8`, 48GB is comfortable |
-| First build | ~45–90 min (Mac build is MPS+CPU only, no CUDA) |
-| Iterate | edit one file → incremental rebuild ~1–5 min |
-| Test MPS code | **requires** Apple Silicon + Metal GPU — this machine is necessary, not just sufficient |
-
-```
-git clone --recursive https://github.com/pytorch/pytorch
-cd pytorch && pip install -r requirements.txt
-MAX_JOBS=8 USE_CUDA=0 python setup.py develop
-```
-
-Allocator code to read: `aten/src/ATen/mps/MPSAllocator.mm` and `MPSAllocator.h`
-(the `MPSHeapAllocatorImpl` — heap/buffer pooling, `EmptyCache`, the high/low
-watermark logic). The likely-interesting path is what `EmptyCache` does and whether
-buffers split into size-pools are ever released.
-
-Do builds/tests only when the training run is **not** using the GPU.
+- On 2.12.0 (current): keep the watchdog (`Config.mem_restart_gb`) plus
+  `scripts/supervise.sh`. Verified to complete a 400-step run.
+- On torch 2.13 stable (when released): upgrade, then remove `mem_restart_gb` and
+  the supervisor. The leak is gone.
 
 ## Environment
 
-- Apple M5 Pro, 48 GB unified memory, macOS 26.4
-- torch 2.12.0, MPS backend
-- Repro: `scripts/mps_leak_repro.py`; workaround: `Config.mem_restart_gb` + `scripts/supervise.sh`
+Apple M5 Pro, 48GB, macOS 26.4. Affected: torch 2.12.0. Verified fixed:
+torch 2.13.0.dev20260601. Diagnostics: `scripts/mps_leak_repro.py`,
+`scripts/mps_op_isolate.py`.
