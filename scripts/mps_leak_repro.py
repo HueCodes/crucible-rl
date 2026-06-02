@@ -7,7 +7,7 @@ what the trainer does), and prints driver-allocated memory. It runs the loop twi
   A) FIXED sequence length every step
   B) VARIABLE (random) sequence length every step  <- matches RL rollouts
 
-Interpretation (this is the whole point — it isolates the cause):
+Interpretation (this is the whole point, it isolates the cause):
   * B grows, A flat   -> the MPS caching allocator hoards a size-bucket per distinct
                          shape and empty_cache() doesn't reclaim it. Arguably intended
                          caching, but empty_cache() not releasing is a real complaint.
@@ -29,7 +29,7 @@ import random
 import torch
 import torch.nn as nn
 
-# Match Qwen2.5-0.5B's large vocab — the [group, seq, vocab] logits are the big
+# Match Qwen2.5-0.5B's large vocab, the [group, seq, vocab] logits are the big
 # tensors and the most likely thing the allocator is bucketing by shape.
 VOCAB = 151936
 HIDDEN = 896
@@ -80,7 +80,7 @@ def run(label: str, fixed_len: int | None):
 
 def main():
     if not torch.backends.mps.is_available():
-        raise SystemExit("MPS not available — run this on the Apple Silicon machine.")
+        raise SystemExit("MPS not available, run this on the Apple Silicon machine.")
     print(f"torch {torch.__version__}\n")
     run("fixed", fixed_len=256)
     run("variable", fixed_len=None)

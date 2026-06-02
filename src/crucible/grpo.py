@@ -16,7 +16,7 @@ def sequence_logprobs(
     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits[:, :-1, :].float()
     targets = input_ids[:, 1:]
     # log p(target) = logit[target] - logsumexp(logits). Computing it this way
-    # avoids materializing the full [B, T, vocab] log_softmax tensor — at this
+    # avoids materializing the full [B, T, vocab] log_softmax tensor, at this
     # model's ~152k vocab that intermediate is ~1GB per call and was OOMing MPS.
     tgt_logit = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     return tgt_logit - torch.logsumexp(logits, dim=-1)
@@ -49,7 +49,7 @@ def grpo_loss(
     # k3 unbiased KL estimator (Schulman): exp(d) - d - 1, d = logp_ref - logp_policy.
     # The estimator is differentiated as part of the objective, so a single token
     # where the policy assigns far lower probability than the reference (d >> 0)
-    # makes exp(d) — and its gradient — blow up, which after grad-norm clipping
+    # makes exp(d), and its gradient, blow up, which after grad-norm clipping
     # crushes the real policy signal and sends training divergent. Clamp the
     # exponent to a sane band so outlier tokens can't dominate the step.
     d = (ref_logp - policy_logp).clamp(-10.0, 10.0)

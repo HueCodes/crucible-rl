@@ -39,10 +39,10 @@ while true; do
   else
     hard_fails=$((hard_fails + 1))
     if [ "$hard_fails" -ge 5 ]; then
-      echo "[supervise] ${hard_fails} consecutive hard failures — stopping." | tee -a "$SLOG"
+      echo "[supervise] ${hard_fails} consecutive hard failures, stopping." | tee -a "$SLOG"
       exit 1
     fi
-    echo "[supervise] hard failure (${hard_fails}/5) — resuming from last checkpoint." | tee -a "$SLOG"
+    echo "[supervise] hard failure (${hard_fails}/5), resuming from last checkpoint." | tee -a "$SLOG"
     sleep 5
     continue
   fi

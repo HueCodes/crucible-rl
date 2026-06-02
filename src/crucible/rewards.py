@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 
 # Rewards a think-then-answer structure. Searched (not full-matched) so trailing
-# or surrounding text doesn't void the bonus — the old anchored ^...$ match meant
+# or surrounding text doesn't void the bonus, the old anchored ^...$ match meant
 # any stray token after </answer> scored zero, so the format reward never fired.
 _FORMAT_RE = re.compile(r"<think>.*?</think>\s*<answer>.*?</answer>", re.DOTALL)
 # Pulls the last <answer> span (models sometimes emit more than one).

@@ -17,3 +17,13 @@ wandb/
 
 # OS
 .DS_Store
+
+# Secrets / local env (none currently tracked; this is a guard)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json

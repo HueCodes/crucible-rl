@@ -13,7 +13,7 @@ from crucible.rewards import correctness_reward, extract_answer, format_reward, 
 GOOD = "<think>2 plus 2 is 4</think><answer>4</answer>"
 WRONG = "<think>guessing</think><answer>5</answer>"
 UNFORMATTED = "the answer is 4"
-# A think/answer block followed by trailing text — common in real generations.
+# A think/answer block followed by trailing text, common in real generations.
 TRAILING = "<think>add them</think>\n<answer>4</answer>\nSo the answer is 4."
 
 

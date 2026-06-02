@@ -41,8 +41,8 @@ two steps so you can confirm the loop trains before committing to a full run.
 `train.py` prints a baseline eval accuracy at step 0, then reward and eval
 accuracy as it goes.
 
-For a full overnight run on MPS, use the supervisor — it checkpoints and
-auto-resumes around PyTorch's MPS allocator leak (see `docs/MPS_LEAK.md`):
+For a full overnight run on MPS, use the supervisor, which checkpoints and
+auto-resumes around the MPS memory growth (see `docs/MPS_LEAK.md`):
 
     scripts/supervise.sh gsm8k_0p5b        # resumes from runs/<preset>/checkpoint.pt
     uv run python -m crucible.train --preset gsm8k_0p5b --resume   # one-off resume

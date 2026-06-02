@@ -73,9 +73,9 @@ def generate_group(policy, tok, prompt_ids: torch.Tensor, cfg: Config, greedy: b
     )
     attn = (out != tok.pad_token_id).long()
     # Completion tokens are everything generated past the prompt, kept up to and
-    # including the first EOS — the stop action we *want* the policy to learn —
-    # and excluding the right-padding after it. pad_token_id == eos_token_id, so
-    # the real EOS is told apart from padding by position (first one), not by id.
+    # including the first EOS (the stop action we want the policy to learn) and
+    # excluding the right-padding after it. pad_token_id == eos_token_id, so the
+    # real EOS is told apart from padding by position (the first one), not by id.
     gen = out[:, prompt_len:]
     eos_seen = (gen == tok.eos_token_id).long().cumsum(dim=1)
     completion_mask = torch.zeros_like(out)
